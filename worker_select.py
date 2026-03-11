@@ -3,26 +3,26 @@ import socket
 import pickle
 import numpy as np
 import time
-import multiprocessing # <--- Nueva importación
+import multiprocessing
 
 # ============ CONFIGURACION ============
-HOST = '127.0.0.1' # <--- RECUERDA: Cambiar por la IP del Server en la PC Worker
+HOST = '192.168.61.213' 
 PORT = 5000
-BUFFER_SIZE = 4096 * 1024
-N_PROCESOS = 4  # <--- Cantidad de sub-procesos locales por worker
+BUFFER_SIZE = 4096 * 1024  # 4MB para el tráfico de arrays de pesos
+N_PROCESOS_LOCALES = 2     # Número de procesos a crear 
 
-# ============ FUNCIONES DE APOYO PARA PARALELISMO ============
+# ============ FUNCIONES GLOBALES (Requeridas para Multiprocessing en Windows) ============
 
 def calcular_gradientes_local(X_sub, y_sub, params):
     """
-    Función que ejecutará cada proceso hijo.
-    Calcula gradientes y pérdida sobre una fracción del dataset local.
+    Función que ejecutan los procesos hijos. 
+    Realiza forward y backward pass sobre una fracción del dataset.
     """
     W1, b1, W2, b2 = params['W1'], params['b1'], params['W2'], params['b2']
     
-    # Forward
+    # Forward Propagation
     z1 = np.dot(X_sub, W1) + b1
-    a1 = np.maximum(0, z1)
+    a1 = np.maximum(0, z1) # ReLU
     z2 = np.dot(a1, W2) + b2
     
     # Softmax estable
@@ -30,91 +30,121 @@ def calcular_gradientes_local(X_sub, y_sub, params):
     exp_z = np.exp(z_estable)
     a2 = exp_z / np.sum(exp_z, axis=1, keepdims=True)
     
-    # Pérdida
+    # Cálculo de Pérdida (Cross-Entropy)
     y_pred = np.clip(a2, 1e-26, 1 - 1e-26)
     perdida = -np.sum(y_sub * np.log(y_pred)) / len(y_sub)
     
-    # Backward
+    # Backward Propagation
     m = X_sub.shape[0]
     dz2 = (a2 - y_sub) / m
     dW2 = np.dot(a1.T, dz2)
     db2 = np.sum(dz2, axis=0)
     da1 = np.dot(dz2, W2.T)
-    dz1 = da1 * (z1 > 0).astype(float)
+    dz1 = da1 * (z1 > 0).astype(float) # Derivada ReLU
     dW1 = np.dot(X_sub.T, dz1)
     db1 = np.sum(dz1, axis=0)
     
     return {'dW1': dW1, 'db1': db1, 'dW2': dW2, 'db2': db2, 'perdida': perdida}
 
-# ============ WORKER PRINCIPAL ============
+# ============ UTILIDADES DE RED ============
+
+def enviar_objeto(sock, obj):
+    """Serializa y envía un objeto usando pickle con encabezado de tamaño"""
+    data = pickle.dumps(obj)
+    size = len(data)
+    sock.sendall(size.to_bytes(8, byteorder='big'))
+    sock.sendall(data)
+
+def recibir_objeto(sock):
+    """Recibe un objeto completo basándose en el tamaño indicado en el encabezado"""
+    size_bytes = sock.recv(8)
+    if not size_bytes:
+        return None
+    size = int.from_bytes(size_bytes, byteorder='big')
+    
+    data = b''
+    while len(data) < size:
+        chunk = sock.recv(min(BUFFER_SIZE, size - len(data)))
+        if not chunk:
+            return None
+        data += chunk
+    return pickle.loads(data)
+
+# ============ CLASE PRINCIPAL DEL WORKER ============
+
 class TrainingWorker:
-    def __init__(self, n_procesos=N_PROCESOS):
+    def __init__(self, n_procesos=N_PROCESOS_LOCALES):
         self.sock = None
         self.X = None
         self.y = None
         self.n_procesos = n_procesos
-        
+
     def conectar(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         while True:
             try:
                 self.sock.connect((HOST, PORT))
-                print(f"[Worker] Conectado al server en {HOST}:{PORT}")
+                print(f"[Worker] Conectado exitosamente a {HOST}:{PORT}")
                 break
             except ConnectionRefusedError:
-                print("[Worker] Servidor no listo. Reintentando...")
+                print("[Worker] Esperando al servidor... (Reintento en 3s)")
                 time.sleep(3)
-        
+
     def ejecutar(self):
         try:
-            # Crear el Pool de procesos una sola vez
+            # Mantener el pool de procesos abierto para evitar overhead de creación
             with multiprocessing.Pool(processes=self.n_procesos) as pool:
                 while True:
                     mensaje = recibir_objeto(self.sock)
+                    
                     if mensaje is None or mensaje.get('tipo') == 'DONE':
+                        print("[Worker] Entrenamiento finalizado o servidor desconectado.")
                         break
                     
                     if mensaje['tipo'] == 'INIT':
                         self.X = mensaje['X']
                         self.y = mensaje['y']
-                        print(f"[Worker] {self.n_procesos} procesos listos para {len(self.X)} muestras")
+                        print(f"[Worker] Dataset recibido. Localmente usando {self.n_procesos} procesos.")
 
                     elif mensaje['tipo'] == 'TRAIN':
                         params = mensaje['params']
                         tasa = mensaje['tasa_aprendizaje']
                         
-                        # 1. Dividir datos locales para los sub-procesos
+                        # Subdivisión local del trabajo
                         X_split = np.array_split(self.X, self.n_procesos)
                         y_split = np.array_split(self.y, self.n_procesos)
                         
-                        # 2. Mapear la tarea a los procesos hijos
+                        # Paralelización local
                         tareas = [(X_s, y_s, params) for X_s, y_s in zip(X_split, y_split)]
-                        resultados_locales = pool.starmap(calcular_gradientes_local, tareas)
+                        resultados_hijos = pool.starmap(calcular_gradientes_local, tareas)
                         
-                        # 3. Reducir (promediar) gradientes y pérdida
-                        grad_promedio = self._promediar_resultados(resultados_locales)
-                        perdida_total = sum(r['perdida'] for r in resultados_locales) / self.n_procesos
+                        # Agregación local (Promedio de gradientes y pérdida)
+                        grad_promedio = self._promediar_gradientes(resultados_hijos)
+                        perdida_promedio = sum(r['perdida'] for r in resultados_hijos) / self.n_procesos
                         
-                        # 4. Actualizar parámetros localmente antes de enviar
-                        nuevos_params = self._actualizar(params, grad_promedio, tasa)
+                        # Actualización local del modelo
+                        nuevos_params = self._aplicar_gradientes(params, grad_promedio, tasa)
                         
+                        # Enviar resultado al servidor central
                         enviar_objeto(self.sock, {
                             'tipo': 'RESULT',
                             'params': nuevos_params,
-                            'perdida': perdida_total,
+                            'perdida': perdida_promedio,
                             'epoca': mensaje['epoca']
                         })
-                        
+        except Exception as e:
+            print(f"[Worker] Error durante la ejecución: {e}")
         finally:
-            self.sock.close()
+            if self.sock:
+                self.sock.close()
 
-    def _promediar_resultados(self, resultados):
+    def _promediar_gradientes(self, resultados):
         promedios = {}
-        for clave in ['dW1', 'db1', 'dW2', 'db2']:
-            promedios[clave] = sum(r[clave] for r in resultados) / len(resultados)
+        for llave in ['dW1', 'db1', 'dW2', 'db2']:
+            promedios[llave] = sum(r[llave] for r in resultados) / len(resultados)
         return promedios
 
-    def _actualizar(self, p, g, lr):
+    def _aplicar_gradientes(self, p, g, lr):
         return {
             'W1': p['W1'] - lr * g['dW1'],
             'b1': p['b1'] - lr * g['db1'],
@@ -122,9 +152,10 @@ class TrainingWorker:
             'b2': p['b2'] - lr * g['db2']
         }
 
-# ... (Mantener funciones enviar_objeto y recibir_objeto del original)
+# ============ PUNTO DE ENTRADA ============
 
 if __name__ == '__main__':
+    # Es vital en Windows que este bloque exista para evitar bucles infinitos de procesos
     worker = TrainingWorker()
     worker.conectar()
     worker.ejecutar()
