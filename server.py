@@ -62,7 +62,6 @@ def log_socket_state(sock, label=""):
     """Log estado del socket"""
     try:
         fileno = sock.fileno()
-        # Obtener info del socket
         local_addr = sock.getsockname() if sock.fileno() != -1 else "CLOSED"
         peer_addr = sock.getpeername() if sock.fileno() != -1 else "N/A"
         log(f"Socket {label}: fd={fileno}, local={local_addr}, peer={peer_addr}")
@@ -116,24 +115,42 @@ def one_hot(y, num_clases=10):
 # COMUNICACIÓN: enviar/recibir con header de 8 bytes
 # --------------------------------------------------
 def enviar_objeto(sock, obj, context=""):
+    """Envía un objeto serializado por el socket con timeout"""
     try:
         data = pickle.dumps(obj)
         size = len(data)
         log(f"Enviando objeto ({context}): tipo={obj.get('tipo', 'N/A')}, size={size} bytes")
         
-        # Enviar tamaño
+        # Enviar tamaño (8 bytes)
         size_bytes = size.to_bytes(8, byteorder='big')
-        sent = sock.sendall(size_bytes)
+        sock.sendall(size_bytes)
         log(f"  Header enviado: 8 bytes")
         
         # Enviar datos
-        sent = sock.sendall(data)
+        sock.sendall(data)
         log(f"  Datos enviados: {size} bytes")
         return True
     except Exception as e:
         log(f"ERROR enviando objeto ({context}): {e}", "ERROR")
-        log(traceback.format_exc(), "ERROR")
         return False
+
+def enviar_objeto_con_timeout(sock, obj, context="", timeout=60.0):
+    """Envía un objeto con timeout para evitar bloqueos indefinidos"""
+    old_timeout = None
+    try:
+        old_timeout = sock.gettimeout()
+        sock.settimeout(timeout)
+        result = enviar_objeto(sock, obj, context)
+        return result
+    except Exception as e:
+        log(f"ERROR enviando objeto con timeout ({context}): {e}", "ERROR")
+        return False
+    finally:
+        try:
+            if old_timeout is not None:
+                sock.settimeout(old_timeout)
+        except:
+            pass
 
 def recibir_objeto(sock, context=""):
     try:
@@ -161,7 +178,7 @@ def recibir_objeto(sock, context=""):
                 return None
             data += chunk
             bytes_recibidos += len(chunk)
-            if bytes_recibidos % (1024*1024) == 0:  # Log cada MB
+            if bytes_recibidos % (1024*1024) == 0:
                 log(f"  Progreso: {bytes_recibidos}/{size} bytes ({100*bytes_recibidos/size:.1f}%)")
         
         obj = pickle.loads(data)
@@ -169,7 +186,6 @@ def recibir_objeto(sock, context=""):
         return obj
     except Exception as e:
         log(f"ERROR recibiendo objeto ({context}): {e}", "ERROR")
-        log(traceback.format_exc(), "ERROR")
         return None
 
 # --------------------------------------------------
@@ -244,6 +260,9 @@ class ExperimentServer:
 
         log(f"Dataset listo: {len(self.X_train)} train, {len(self.X_test)} test")
         os.makedirs(DIRECTORIO_RESULTADOS, exist_ok=True)
+        
+        # Almacenar datos particionados para cada worker
+        self.datos_por_worker = {}
 
     def _crear_parametros_iniciales(self):
         return {
@@ -286,7 +305,8 @@ class ExperimentServer:
                     'region': region, 
                     'name': name,
                     'worker_id': i + 1,
-                    'connected_at': time.time()
+                    'connected_at': time.time(),
+                    'initialized': False  # Track initialization status
                 }
                 conexiones.append(worker_info)
                 log_worker_state(i+1, "CONNECTED", f"name={name}, region={region}, addr={addr}")
@@ -301,28 +321,99 @@ class ExperimentServer:
         
         return conexiones
 
-    def _enviar_inicializacion(self, conexiones_seleccionadas, partes, exp_num):
-        log_experiment_state(exp_num, "INIT_PHASE", f"Enviando INIT a {len(conexiones_seleccionadas)} workers")
+    def _inicializar_todos_los_workers(self, conexiones):
+        """
+        CRITICAL FIX: Initialize ALL workers immediately after connection.
+        This ensures every worker is ready to participate in any experiment.
+        """
+        log("=" * 80)
+        log("INICIALIZANDO TODOS LOS WORKERS (CRITICAL FIX)")
+        log("=" * 80)
         
-        for i, entry in enumerate(conexiones_seleccionadas):
-            conn = entry['sock']
-            worker_id = entry['worker_id']
-            log(f"Enviando INIT a worker {worker_id} ({entry['name']})...")
-            log_socket_state(conn, f"worker_{worker_id}_pre_init")
+        # Dividir el dataset en MAX_WORKERS partes (una para cada worker)
+        partes = dividir_dataset(self.X_train, self.y_train_one_hot, MAX_WORKERS)
+        
+        # Enviar INIT a cada worker con su porción de datos
+        for i, worker_info in enumerate(conexiones):
+            conn = worker_info['sock']
+            worker_id = worker_info['worker_id']
+            
+            log(f"Enviando INIT a worker {worker_id} ({worker_info['name']})...")
+            log_socket_state(conn, f"worker_{worker_id}_init_all")
             
             try:
+                # Establecer timeout para evitar bloqueos indefinidos
+                conn.settimeout(120.0)  # 2 minutos para INIT (datos grandes)
+                
                 mensaje_init = {
                     'tipo': 'INIT',
                     'X': partes[i][0],
                     'y': partes[i][1],
-                    'exp_num': exp_num,
+                    'exp_num': 0,  # exp_num=0 indica inicialización global
                     'worker_idx': i
                 }
-                success = enviar_objeto(conn, mensaje_init, f"INIT_to_worker_{worker_id}")
+                
+                success = enviar_objeto(conn, mensaje_init, f"GLOBAL_INIT_to_worker_{worker_id}")
+                
+                if success:
+                    worker_info['initialized'] = True
+                    log(f"  INIT enviado exitosamente a worker {worker_id}")
+                else:
+                    log(f"  FALLO al enviar INIT a worker {worker_id}", "ERROR")
+                    
+            except socket.timeout:
+                log(f"  TIMEOUT enviando INIT a worker {worker_id}", "ERROR")
+            except Exception as e:
+                log(f"  ERROR enviando INIT a worker {worker_id}: {e}", "ERROR")
+                log(traceback.format_exc(), "ERROR")
+        
+        # Contar cuántos workers se inicializaron correctamente
+        initialized_count = sum(1 for c in conexiones if c.get('initialized', False))
+        log(f"Workers inicializados: {initialized_count}/{len(conexiones)}")
+        
+        if initialized_count < MAX_WORKERS:
+            log("ADVERTENCIA: No todos los workers se inicializaron correctamente", "WARN")
+        
+        log("=" * 80)
+        
+        # Guardar las particiones de datos para usarlas en los experimentos
+        self.datos_por_worker = {i: partes[i] for i in range(MAX_WORKERS)}
+
+    def _enviar_inicializacion_experimento(self, conexiones_seleccionadas, exp_num):
+        """
+        Envía INIT a los workers seleccionados para un experimento específico.
+        Como los workers ya están inicializados, esto es más un "re-init" para
+        sincronizar el número de experimento.
+        """
+        log_experiment_state(exp_num, "INIT_PHASE", f"Enviando INIT a {len(conexiones_seleccionadas)} workers")
+        
+        for i, worker_info in enumerate(conexiones_seleccionadas):
+            conn = worker_info['sock']
+            worker_id = worker_info['worker_id']
+            worker_idx_global = worker_info['worker_id'] - 1  # 0-based index
+            
+            log(f"Enviando INIT a worker {worker_id} ({worker_info['name']})...")
+            log_socket_state(conn, f"worker_{worker_id}_pre_init")
+            
+            try:
+                # Usar los datos pre-particionados
+                X_worker, y_worker = self.datos_por_worker[worker_idx_global]
+                
+                mensaje_init = {
+                    'tipo': 'INIT',
+                    'X': X_worker,
+                    'y': y_worker,
+                    'exp_num': exp_num,
+                    'worker_idx': i  # índice dentro del experimento actual
+                }
+                
+                success = enviar_objeto_con_timeout(conn, mensaje_init, f"INIT_to_worker_{worker_id}", timeout=120.0)
+                
                 if success:
                     log(f"  INIT enviado exitosamente a worker {worker_id}")
                 else:
                     log(f"  FALLO al enviar INIT a worker {worker_id}", "ERROR")
+                    
             except Exception as e:
                 log(f"  ERROR enviando INIT a worker {worker_id}: {e}", "ERROR")
                 log(traceback.format_exc(), "ERROR")
@@ -332,9 +423,6 @@ class ExperimentServer:
     def _select_participantes(self, conexiones, n_active, exp_num):
         """
         Selecciona n_active workers asegurando incluir al menos uno con region 'westus2'.
-        
-        BUG FIX: Selecciona los primeros N workers de la lista para asegurar que
-        todos los workers seleccionados ya hayan recibido INIT en experimentos anteriores.
         """
         log_experiment_state(exp_num, "SELECTION_PHASE", f"Seleccionando {n_active} workers de {len(conexiones)} disponibles")
         
@@ -348,21 +436,26 @@ class ExperimentServer:
             log(f"ADVERTENCIA: solo {len(conexiones)} workers conectados, requerido {n_active}. Se usará lo disponible.", "WARN")
             n_active = len(conexiones)
         
-        # BUG FIX: Select first N workers (sequential selection)
-        # This ensures all selected workers have already received INIT in previous experiments
+        # Seleccionar los primeros N workers
         selected = conexiones[:n_active]
         log(f"  Selección inicial (primeros {n_active}): {[c['worker_id'] for c in selected]}")
         
-        # Check if we have at least one westus2
+        # Verificar si hay al menos un westus2
         has_west = any(c['region_norm'] == 'westus2' for c in selected)
         
         if not has_west and west:
-            # Replace the last selected worker with the first westus2 worker
+            # Reemplazar el último worker seleccionado con el primer westus2
             west_worker = west[0]
             if west_worker not in selected:
                 removed = selected.pop()
                 selected.append(west_worker)
                 log(f"  Reemplazado worker {removed['worker_id']} con westus2 worker {west_worker['worker_id']}")
+        
+        # Filtrar workers que no están inicializados (fallaron en la inicialización global)
+        selected_inicializados = [c for c in selected if c.get('initialized', False)]
+        if len(selected_inicializados) < len(selected):
+            log(f"ADVERTENCIA: {len(selected) - len(selected_inicializados)} workers seleccionados no están inicializados", "WARN")
+            selected = selected_inicializados
         
         log(f"Selección final: {len(selected)} workers")
         for idx, s in enumerate(selected):
@@ -375,13 +468,16 @@ class ExperimentServer:
         
         historial_perdida = []
         n_activos = len(conexiones_seleccionadas)
+        
+        if n_activos == 0:
+            log("ERROR: No hay workers activos para el entrenamiento", "ERROR")
+            return [], 0, params
+        
         inicializar_csv(ruta_csv, n_activos, n_procesos)
         tiempo_inicio_total = time.perf_counter()
 
-        # sockets list
         sockets = [c['sock'] for c in conexiones_seleccionadas]
         
-        # Log estado inicial de sockets
         log("Estado inicial de sockets:")
         for i, c in enumerate(conexiones_seleccionadas):
             log_socket_state(c['sock'], f"worker_{c['worker_id']}_start")
@@ -402,7 +498,7 @@ class ExperimentServer:
                         'epoca': epoca,
                         'exp_num': exp_num
                     }
-                    success = enviar_objeto(conn, mensaje, f"TRAIN_exp{exp_num}_ep{epoca}_worker{worker_id}")
+                    success = enviar_objeto_con_timeout(conn, mensaje, f"TRAIN_exp{exp_num}_ep{epoca}_worker{worker_id}", timeout=30.0)
                     if not success:
                         log(f"  FALLO enviando TRAIN a worker {worker_id}", "ERROR")
                 except Exception as e:
@@ -423,11 +519,10 @@ class ExperimentServer:
                     log(f"    Socket pendiente {i}: worker {worker_id}")
                 
                 try:
-                    legibles, _, excepciones = select.select(sockets_pendientes, [], sockets_pendientes, 30.0)  # 30s timeout
+                    legibles, _, excepciones = select.select(sockets_pendientes, [], sockets_pendientes, 60.0)
                     log(f"  Select retornó: {len(legibles)} legibles, {len(excepciones)} excepciones")
                 except Exception as e:
                     log(f"  ERROR en select: {e}", "ERROR")
-                    log(traceback.format_exc(), "ERROR")
                     break
 
                 for sock in excepciones:
@@ -465,7 +560,6 @@ class ExperimentServer:
                             log(f"    Respuesta inesperada de worker {worker_id}: {respuesta}", "WARN")
                     except Exception as e:
                         log(f"    ERROR recibiendo de worker: {e}", "ERROR")
-                        log(traceback.format_exc(), "ERROR")
                         if sock in sockets_pendientes:
                             sockets_pendientes.remove(sock)
 
@@ -519,6 +613,9 @@ class ExperimentServer:
         conexiones = self._esperar_conexiones(server_socket)
         server_socket.close()
         log("Socket servidor cerrado después de aceptar conexiones")
+        
+        # CRITICAL FIX: Inicializar TODOS los workers inmediatamente
+        self._inicializar_todos_los_workers(conexiones)
 
         # ejecutar experimentos 1..MAX_WORKERS
         for idx, n_procesos in enumerate(EXPERIMENTOS_PROCESOS):
@@ -534,14 +631,17 @@ class ExperimentServer:
 
             # seleccionar subset que garantice al menos un westus2
             seleccion = self._select_participantes(conexiones, n_procesos, exp_num)
+            
+            if len(seleccion) == 0:
+                log("ERROR: No hay workers disponibles para este experimento", "ERROR")
+                continue
 
-            # preparar parametros y dataset dividido en n_procesos
+            # preparar parametros
             params = self._crear_parametros_iniciales()
-            partes = dividir_dataset(self.X_train, self.y_train_one_hot, len(seleccion))
             ruta_csv = os.path.join(DIRECTORIO_RESULTADOS, f'experimento_{n_procesos}workers.csv')
 
-            # enviar init sólo a los seleccionados
-            self._enviar_inicializacion(seleccion, partes, exp_num)
+            # enviar init a los seleccionados (re-init para sincronizar exp_num)
+            self._enviar_inicializacion_experimento(seleccion, exp_num)
 
             log(f"Iniciando entrenamiento con {len(seleccion)} workers...")
             historial, tiempo_total, params_finales = self._ejecutar_entrenamiento(seleccion, params, ruta_csv, n_procesos, exp_num)
@@ -580,7 +680,7 @@ class ExperimentServer:
         for c in conexiones:
             try:
                 log(f"  Enviando EXPERIMENT_END a worker {c['worker_id']} ({c['name']})...")
-                enviar_objeto(c['sock'], {'tipo': 'EXPERIMENT_END'}, f"END_to_worker_{c['worker_id']}")
+                enviar_objeto_con_timeout(c['sock'], {'tipo': 'EXPERIMENT_END'}, f"END_to_worker_{c['worker_id']}", timeout=30.0)
                 c['sock'].close()
                 log(f"    Worker {c['worker_id']} notificado y desconectado")
             except Exception as e:
