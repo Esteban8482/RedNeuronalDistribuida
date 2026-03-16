@@ -331,7 +331,10 @@ class ExperimentServer:
 
     def _select_participantes(self, conexiones, n_active, exp_num):
         """
-        Selecciona n_active workers asegurando incluir al menos uno con region 'westus2'
+        Selecciona n_active workers asegurando incluir al menos uno con region 'westus2'.
+        
+        BUG FIX: Selecciona los primeros N workers de la lista para asegurar que
+        todos los workers seleccionados ya hayan recibido INIT en experimentos anteriores.
         """
         log_experiment_state(exp_num, "SELECTION_PHASE", f"Seleccionando {n_active} workers de {len(conexiones)} disponibles")
         
@@ -340,40 +343,27 @@ class ExperimentServer:
             c['region_norm'] = c['region'].lower() if isinstance(c['region'], str) else 'unknown'
         
         west = [c for c in conexiones if c['region_norm'] == 'westus2']
-        others = [c for c in conexiones if c['region_norm'] != 'westus2']
         
-        log(f"  Workers en westus2: {len(west)}")
-        log(f"  Workers en otras regiones: {len(others)}")
-        
-        selected = []
-
         if len(conexiones) < n_active:
             log(f"ADVERTENCIA: solo {len(conexiones)} workers conectados, requerido {n_active}. Se usará lo disponible.", "WARN")
             n_active = len(conexiones)
-
-        # siempre incluir uno westus2 si existe
-        if west:
-            selected.append(west[0])
-            log(f"  Seleccionado westus2: worker {west[0]['worker_id']} ({west[0]['name']})")
-
-        # completar hasta n_active por orden
-        for c in conexiones:
-            if c in selected:
-                continue
-            selected.append(c)
-            log(f"  Seleccionado adicional: worker {c['worker_id']} ({c['name']})")
-            if len(selected) >= n_active:
-                break
-
-        # si no alcanzó, reintentar llenando con others
-        if len(selected) < n_active:
-            for c in others:
-                if c not in selected:
-                    selected.append(c)
-                    log(f"  Seleccionado de relleno: worker {c['worker_id']} ({c['name']})")
-                    if len(selected) >= n_active:
-                        break
-
+        
+        # BUG FIX: Select first N workers (sequential selection)
+        # This ensures all selected workers have already received INIT in previous experiments
+        selected = conexiones[:n_active]
+        log(f"  Selección inicial (primeros {n_active}): {[c['worker_id'] for c in selected]}")
+        
+        # Check if we have at least one westus2
+        has_west = any(c['region_norm'] == 'westus2' for c in selected)
+        
+        if not has_west and west:
+            # Replace the last selected worker with the first westus2 worker
+            west_worker = west[0]
+            if west_worker not in selected:
+                removed = selected.pop()
+                selected.append(west_worker)
+                log(f"  Reemplazado worker {removed['worker_id']} con westus2 worker {west_worker['worker_id']}")
+        
         log(f"Selección final: {len(selected)} workers")
         for idx, s in enumerate(selected):
             log(f"   #{idx+1} -> worker_id={s['worker_id']}, name={s.get('name')}, region={s.get('region')}, addr={s.get('addr')}")
