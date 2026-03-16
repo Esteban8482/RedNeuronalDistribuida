@@ -1,5 +1,9 @@
-# Modified worker.py - Single Process Version
-import socket, pickle, numpy as np, time
+import socket, pickle, numpy as np, time, argparse, socket as s_mod
+import os
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--region', type=str, default=None, help='region del worker (ej. westus2, eastus)')
+args = parser.parse_args()
 
 HOST = '172.178.121.181'
 PORT = 5000
@@ -32,14 +36,19 @@ def enviar_objeto(sock, obj):
     sock.sendall(data)
 
 def recibir_objeto(sock):
-    size = int.from_bytes(sock.recv(8), 'big')
+    size_bytes = sock.recv(8)
+    if not size_bytes:
+        return None
+    size = int.from_bytes(size_bytes, 'big')
     data = b''
     while len(data) < size:
         data += sock.recv(min(BUFFER_SIZE, size - len(data)))
     return pickle.loads(data)
 
 if __name__ == '__main__':
-    print(f'Connecting to {HOST}:{PORT}...')
+    region = args.region or (os.environ.get('REGION') if 'os' in globals() else None) or 'unknown'
+    hostname = s_mod.gethostname()
+    print(f'Connecting to {HOST}:{PORT} from host={hostname} region={region}...')
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     for i in range(30):
         try:
@@ -48,14 +57,22 @@ if __name__ == '__main__':
             break
         except:
             time.sleep(2)
+
+    # enviar HELLO con metadata
+    try:
+        enviar_objeto(sock, {'tipo': 'HELLO', 'region': region, 'name': hostname})
+    except Exception as e:
+        print('Error enviando HELLO:', e)
+
     X, y = None, None
     while True:
         msg = recibir_objeto(sock)
-        if msg is None: break
-        if msg['tipo'] == 'INIT':
+        if msg is None:
+            break
+        if msg.get('tipo') == 'INIT':
             X, y = msg['X'], msg['y']
-            print(f'Received {len(X)} samples')
-        elif msg['tipo'] == 'TRAIN':
+            print(f'Received INIT with {len(X)} samples')
+        elif msg.get('tipo') == 'TRAIN':
             t0 = time.perf_counter()
             grad = calcular_gradientes(X, y, msg['params'])
             p = msg['params']
@@ -70,9 +87,9 @@ if __name__ == '__main__':
                 'tipo': 'RESULT', 'params': new_params,
                 'perdida': grad['perdida'],
                 'tiempo_computo': round(time.perf_counter()-t0, 4)
-            }) 
-        elif msg['tipo'] == 'EXPERIMENT_END':
-            print('Experiment completed')
+            })
+        elif msg.get('tipo') == 'EXPERIMENT_END':
+            print('Experiment completed (received EXPERIMENT_END)')
             break
     sock.close()
     print('Worker finished')
