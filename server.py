@@ -1,15 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Server Experimental - Coordina entrenamiento distribuido con malla de experimentación.
-Ejecuta automáticamente experimentos con 2, 4, 6, 8 y 10 procesos por worker.
-
-USO:
-    python server.py
-
-CONFIGURACIÓN:
-    Modificar N_WORKERS abajo para cambiar la cantidad de workers esperados.
-"""
-
 import socket
 import pickle
 import select
@@ -19,27 +7,14 @@ import os
 import time
 from sklearn.datasets import fetch_openml
 
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                        CONFIGURACIÓN DEL EXPERIMENTO                      ║
-# ╠══════════════════════════════════════════════════════════════════════════╣
-# ║  N_WORKERS: Número de workers que participarán en el experimento.         ║
-# ║            Este valor determina cuántas máquinas worker deben conectarse. ║
-# ║            IMPORTANTE: Debe coincidir con la cantidad de workers que      ║
-# ║            ejecutes en tu laboratorio.                                    ║
-# ╠──────────────────────────────────────────────────────────────────────────╣
-# ║  EXPERIMENTOS_PROCESOS: Lista de configuraciones de procesos a probar.    ║
-# ║            Cada valor representa el número de procesos locales que        ║
-# ║            cada worker utilizará para el cómputo paralelo.                ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-N_WORKERS = 2                      # ← CAMBIAR ESTO según tu laboratorio
-EXPERIMENTOS_PROCESOS = [2, 4, 6, 8, 10]  # Configuraciones a probar
+N_WORKERS = 2
+EXPERIMENTOS_PROCESOS = [1]  # Constante de version anterior
 EPOCAS = 100
 TASA_APRENDIZAJE = 0.1
 HOST = '0.0.0.0'
 PORT = 5000
-BUFFER_SIZE = 4096 * 1024          # 4MB para arrays grandes
-SELECT_TIMEOUT = None              # None = esperar indefinidamente
+BUFFER_SIZE = 4096 * 1024
+SELECT_TIMEOUT = None # None = esperar indefinidamente
 DIRECTORIO_RESULTADOS = 'resultados'
 
 
