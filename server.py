@@ -12,7 +12,7 @@ from sklearn.datasets import fetch_openml
 # --------------------------------------------------
 N_WORKERS        = 2
 N_NEURONAS       = 256               # neuronas de la capa oculta, fijo
-MALLA_EPOCAS     = [100, 500, 1000]  # configuraciones a comparar
+MALLA_EPOCAS     = [100, 250, 500]  # configuraciones a comparar
 REPETICIONES     = 5                 # repeticiones por configuración
 TASA_APRENDIZAJE = 0.1
 HOST             = '0.0.0.0'
