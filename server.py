@@ -11,9 +11,9 @@ from sklearn.datasets import fetch_openml
 # CONFIG  ← los únicos valores que hay que tocar
 # --------------------------------------------------
 N_WORKERS        = 2
-MALLA_NEURONAS   = [100, 300, 500]   # configuraciones de la capa oculta
+N_NEURONAS       = 256               # neuronas de la capa oculta, fijo
+MALLA_EPOCAS     = [100, 500, 1000]  # configuraciones a comparar
 REPETICIONES     = 5                 # repeticiones por configuración
-EPOCAS           = 100
 TASA_APRENDIZAJE = 0.1
 HOST             = '0.0.0.0'
 PORT             = 5000
@@ -29,12 +29,11 @@ def log(msg):
 # --------------------------------------------------
 # RED NEURONAL
 # --------------------------------------------------
-def crear_params(n_neuronas):
-    """Inicializa pesos para una red 784 → n_neuronas → 10."""
+def crear_params():
     return {
-        'W1': np.random.randn(784, n_neuronas) * 0.05,
-        'b1': np.full(n_neuronas, 0.01, dtype=float),
-        'W2': np.random.randn(n_neuronas, 10) * 0.05,
+        'W1': np.random.randn(784, N_NEURONAS) * 0.05,
+        'b1': np.full(N_NEURONAS, 0.01, dtype=float),
+        'W2': np.random.randn(N_NEURONAS, 10) * 0.05,
         'b2': np.full(10, 0.01, dtype=float),
     }
 
@@ -88,25 +87,28 @@ def recibir_objeto(sock):
 # --------------------------------------------------
 # CSV
 #
-# Esquema diseñado para comparar entre experimentos:
-#   n_workers y n_neuronas son columnas clave en ambos archivos,
-#   lo que permite hacer JOIN/filter al combinar con otros experimentos.
+# detalle_Nworkers.csv
+#   Progresión época a época de cada corrida.
+#   Útil para graficar curvas de aprendizaje.
+#   Clave: (n_workers, n_neuronas, n_epocas_config, repeticion, epoca)
 #
-# detalle_Nworkers.csv  → una fila por (n_neuronas × repeticion × epoca)
-# resumen_Nworkers.csv  → una fila por (n_neuronas × epoca),
-#                          con media y std sobre las REPETICIONES
+# resumen_Nworkers.csv
+#   Una fila por repetición completada con sus métricas finales.
+#   Diseñado para comparar entre experimentos con distinto n_workers:
+#   al concatenar resumen_2workers.csv + resumen_4workers.csv + ...
+#   se puede filtrar/agrupar por n_workers y comparar directamente
+#   precisión final y tiempo de entrenamiento.
+#   Clave: (n_workers, n_neuronas, n_epocas_config, repeticion)
 # --------------------------------------------------
 CABECERA_DETALLE = [
-    'n_workers', 'n_neuronas', 'repeticion', 'epoca',
-    'perdida', 'precision_test',
-    'tiempo_epoca_seg', 't_computo_max', 't_computo_min', 't_computo_avg',
+    'n_workers', 'n_neuronas', 'n_epocas_config', 'repeticion', 'epoca',
+    'perdida', 'precision_test', 'tiempo_epoca_seg',
 ]
 
 CABECERA_RESUMEN = [
-    'n_workers', 'n_neuronas', 'epoca',
-    'perdida_media', 'perdida_std',
-    'precision_test_media', 'precision_test_std',
-    'tiempo_epoca_media', 'tiempo_epoca_std',
+    'n_workers', 'n_neuronas', 'n_epocas_config', 'repeticion',
+    'precision_test_final', 'perdida_final',
+    'tiempo_total_seg', 'tiempo_promedio_epoca_seg',
 ]
 
 def inicializar_csv(ruta, cabecera):
@@ -115,56 +117,41 @@ def inicializar_csv(ruta, cabecera):
         csv.writer(f).writerow(cabecera)
     log(f"CSV creado: {ruta}")
 
-def guardar_fila_detalle(ruta, n_neuronas, rep, epoca,
-                         perdida, precision, t_epoca, tiempos):
+def guardar_fila_detalle(ruta, n_epocas_config, rep, epoca,
+                         perdida, precision, t_epoca):
     with open(ruta, 'a', newline='') as f:
         csv.writer(f).writerow([
-            N_WORKERS, n_neuronas, rep, epoca,
+            N_WORKERS, N_NEURONAS, n_epocas_config, rep, epoca,
             round(perdida,   6),
             round(precision, 6),
             round(t_epoca,   4),
-            round(max(tiempos), 4) if tiempos else -1,
-            round(min(tiempos), 4) if tiempos else -1,
-            round(sum(tiempos) / len(tiempos), 4) if tiempos else -1,
         ])
 
-def guardar_resumen_configuracion(ruta, n_neuronas, historia):
-    """
-    historia: lista de REPETICIONES listas, cada una con EPOCAS dicts
-              {perdida, precision, t_epoca}.
-    Escribe una fila por época con media y std entre repeticiones.
-    """
+def guardar_fila_resumen(ruta, n_epocas_config, rep, historial):
+    """Una fila por repetición completada con sus métricas finales."""
+    tiempo_total   = sum(e['t_epoca']   for e in historial)
+    tiempo_promedio = tiempo_total / len(historial)
     with open(ruta, 'a', newline='') as f:
-        writer = csv.writer(f)
-        for epoca in range(EPOCAS):
-            perdidas    = [historia[r][epoca]['perdida']   for r in range(REPETICIONES)]
-            precisiones = [historia[r][epoca]['precision'] for r in range(REPETICIONES)]
-            tiempos     = [historia[r][epoca]['t_epoca']   for r in range(REPETICIONES)]
-            writer.writerow([
-                N_WORKERS,
-                n_neuronas,
-                epoca,
-                round(float(np.mean(perdidas)),         6),
-                round(float(np.std(perdidas,  ddof=1)), 6),
-                round(float(np.mean(precisiones)),      6),
-                round(float(np.std(precisiones, ddof=1)), 6),
-                round(float(np.mean(tiempos)),          4),
-                round(float(np.std(tiempos,   ddof=1)), 4),
-            ])
+        csv.writer(f).writerow([
+            N_WORKERS,
+            N_NEURONAS,
+            n_epocas_config,
+            rep,
+            round(historial[-1]['precision'], 6),
+            round(historial[-1]['perdida'],   6),
+            round(tiempo_total,              2),
+            round(tiempo_promedio,           4),
+        ])
 
 # --------------------------------------------------
 # BUCLE DE ENTRENAMIENTO (una sola repetición)
 # --------------------------------------------------
-def ejecutar_entrenamiento(conexiones, n_neuronas, rep,
+def ejecutar_entrenamiento(conexiones, n_epocas_config, rep,
                            X_test, y_test, ruta_detalle):
-    """
-    Entrena EPOCAS épocas con los workers ya inicializados.
-    Devuelve lista de EPOCAS dicts {perdida, precision, t_epoca}.
-    """
-    params = crear_params(n_neuronas)
+    params = crear_params()
     historial = []
 
-    for epoca in range(EPOCAS):
+    for epoca in range(n_epocas_config):
         t0 = time.perf_counter()
 
         for c in conexiones:
@@ -186,18 +173,17 @@ def ejecutar_entrenamiento(conexiones, n_neuronas, rep,
         if resultados:
             params    = promediar_pesos([r['params'] for r in resultados])
             perdida   = float(np.mean([r['perdida']  for r in resultados]))
-            tiempos   = [r['tiempo_computo']          for r in resultados]
             precision = calcular_precision(X_test, y_test, params)
         else:
-            perdida, precision, tiempos = -1.0, -1.0, []
+            perdida, precision = -1.0, -1.0
 
         historial.append({'perdida': perdida, 'precision': precision, 't_epoca': t_epoca})
-        guardar_fila_detalle(ruta_detalle, n_neuronas, rep,
-                             epoca, perdida, precision, t_epoca, tiempos)
+        guardar_fila_detalle(ruta_detalle, n_epocas_config, rep,
+                             epoca, perdida, precision, t_epoca)
 
-        if epoca % 20 == 0 or epoca == EPOCAS - 1:
-            log(f"  [n={n_neuronas:>3} rep={rep}] "
-                f"época {epoca:>3}/{EPOCAS} | "
+        if epoca % 50 == 0 or epoca == n_epocas_config - 1:
+            log(f"  [épocas={n_epocas_config:>4} rep={rep}] "
+                f"época {epoca+1:>4}/{n_epocas_config} | "
                 f"pérdida={perdida:.4f} | "
                 f"test={precision*100:.1f}% | "
                 f"t={t_epoca:.2f}s")
@@ -239,8 +225,6 @@ if __name__ == '__main__':
     server_sock.close()
 
     # ── Distribuir datos UNA sola vez ─────────────────────────────
-    # Los datos no cambian entre configuraciones ni repeticiones;
-    # solo cambia la forma de los parámetros (n_neuronas).
     partes = dividir_dataset(X_train, y_train_oh, N_WORKERS)
     for i, c in enumerate(conexiones):
         enviar_objeto(c['sock'], {
@@ -258,38 +242,29 @@ if __name__ == '__main__':
     inicializar_csv(ruta_resumen, CABECERA_RESUMEN)
 
     # ── Malla de experimentación ──────────────────────────────────
-    total_configs = len(MALLA_NEURONAS)
-    for cfg_idx, n_neuronas in enumerate(MALLA_NEURONAS, start=1):
+    total_configs = len(MALLA_EPOCAS)
+    for cfg_idx, n_epocas_config in enumerate(MALLA_EPOCAS, start=1):
         log("=" * 60)
-        log(f"CONFIGURACIÓN {cfg_idx}/{total_configs}: {n_neuronas} neuronas ocultas  "
-            f"({REPETICIONES} repeticiones × {EPOCAS} épocas)")
+        log(f"CONFIGURACIÓN {cfg_idx}/{total_configs}: {n_epocas_config} épocas  "
+            f"({REPETICIONES} repeticiones · {N_NEURONAS} neuronas ocultas)")
         log("=" * 60)
-
-        historia_config = []   # acumula REPETICIONES historiales
 
         for rep in range(1, REPETICIONES + 1):
             log(f"  ── Repetición {rep}/{REPETICIONES} ──")
             t_rep = time.perf_counter()
 
             historial = ejecutar_entrenamiento(
-                conexiones, n_neuronas, rep,
+                conexiones, n_epocas_config, rep,
                 X_test, y_test, ruta_detalle,
             )
-            historia_config.append(historial)
+
+            # Guardar fila de resumen inmediatamente al terminar la repetición
+            guardar_fila_resumen(ruta_resumen, n_epocas_config, rep, historial)
 
             log(f"  Repetición {rep} finalizada en "
                 f"{time.perf_counter()-t_rep:.1f}s | "
                 f"pérdida final={historial[-1]['perdida']:.4f} | "
                 f"test final={historial[-1]['precision']*100:.2f}%\n")
-
-        # ── Agregar y guardar resumen de la configuración ─────────
-        guardar_resumen_configuracion(ruta_resumen, n_neuronas, historia_config)
-
-        precisiones_finales = [historia_config[r][-1]['precision'] for r in range(REPETICIONES)]
-        log(f"  RESUMEN {n_neuronas} neuronas | "
-            f"precisión test → "
-            f"media={np.mean(precisiones_finales)*100:.2f}% · "
-            f"std={np.std(precisiones_finales, ddof=1)*100:.2f}%\n")
 
     # ── Cerrar workers ────────────────────────────────────────────
     for c in conexiones:
