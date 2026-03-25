@@ -1,10 +1,3 @@
-# ============================================================
-#  server.py  –  Parameter server con FedAvg (PyTorch + CNN)
-#  Dataset  : CIFAR-10  (32×32×3, 10 clases)
-#  Protocolo: igual que la versión MNIST original
-#             INIT → TRAIN×N_rondas → EXPERIMENT_END
-# ============================================================
-
 import socket
 import pickle
 import csv
@@ -18,55 +11,46 @@ import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 
-# ──────────────────────────────────────────────────────────────
-#  CONFIG  ← los únicos valores que hay que tocar
-# ──────────────────────────────────────────────────────────────
-N_WORKERS    = 2
+N_WORKERS = 1
 
-# Cada valor es el número de RONDAS de comunicación a comparar.
-# Una ronda = workers entrenan 1 epoch sobre su shard y devuelven pesos.
-MALLA_RONDAS  = [30, 60, 100]
+EPOCHS_GRID = [50] 
 
-REPETICIONES        = 3
-TASA_APRENDIZAJE    = 0.001   # Adam en los workers
-BATCH_SIZE          = 128     # tamaño de mini-batch en los workers
+REPETITIONS = 3
+LEARNING_RATE = 0.001 
+BATCH_SIZE = 128
 
-HOST        = '0.0.0.0'
-PORT        = 5000
+HOST = '0.0.0.0'
+PORT = 5000
 BUFFER_SIZE = 4096 * 1024
-DIRECTORIO_RESULTADOS = 'resultados'
+RESULTS_DIR = 'resultados'
 
-DEVICE = torch.device('cpu')   # el servidor sólo promedia y evalúa
+DEVICE = torch.device('cpu')
+
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2470, 0.2435, 0.2616)
 
 
 # ──────────────────────────────────────────────────────────────
-#  LOGGING
+#  SHARED COMPONENTS (duplicated in worker.py)
 # ──────────────────────────────────────────────────────────────
 def log(msg):
+    """Timestamped logging."""
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ──────────────────────────────────────────────────────────────
-#  ARQUITECTURA CNN (debe ser idéntica en worker.py)
-#
-#  Cambio respecto al diagrama: sin Softmax final.
-#  CrossEntropyLoss ya incluye log-softmax; añadirlo explícitamente
-#  causa inestabilidad numérica. Es la práctica estándar en PyTorch.
-# ──────────────────────────────────────────────────────────────
 class CIFAR10CNN(nn.Module):
+    """CNN architecture for CIFAR-10 classification.
+    """
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            # ── Bloque conv 1  →  16×16×32 ──────────────────
-            nn.Conv2d(3,  32, 3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(),
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
             nn.MaxPool2d(2), nn.Dropout2d(0.2),
-            # ── Bloque conv 2  →  8×8×64 ────────────────────
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
             nn.MaxPool2d(2), nn.Dropout2d(0.3),
-            # ── Bloque conv 3  →  4×4×128 ───────────────────
-            nn.Conv2d(64,  128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
             nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
             nn.MaxPool2d(2), nn.Dropout2d(0.4),
         )
@@ -74,47 +58,22 @@ class CIFAR10CNN(nn.Module):
             nn.Flatten(),
             nn.Linear(128 * 4 * 4, 128), nn.BatchNorm1d(128), nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, 10),           # sin Softmax — ver nota arriba
+            nn.Linear(128, 10),
         )
 
     def forward(self, x):
         return self.classifier(self.features(x))
 
 
-# ──────────────────────────────────────────────────────────────
-#  FedAvg: promedio de state_dicts
-# ──────────────────────────────────────────────────────────────
-def promediar_state_dicts(lista_sd):
-    avg = copy.deepcopy(lista_sd[0])
-    for key in avg:
-        avg[key] = torch.stack([sd[key].float() for sd in lista_sd]).mean(dim=0)
-    return avg
-
-
-# ──────────────────────────────────────────────────────────────
-#  EVALUACIÓN (servidor, sin gradientes)
-# ──────────────────────────────────────────────────────────────
-def calcular_precision(model, loader):
-    model.eval()
-    correct = total = 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            correct += (model(x).argmax(1) == y).sum().item()
-            total   += len(y)
-    return correct / total
-
-
-# ──────────────────────────────────────────────────────────────
-#  COMUNICACIÓN
-# ──────────────────────────────────────────────────────────────
-def enviar_objeto(sock, obj):
+def send_object(sock, obj):
+    """Send a pickled object over socket with 8-byte size header."""
     data = pickle.dumps(obj)
     sock.sendall(len(data).to_bytes(8, 'big'))
     sock.sendall(data)
 
 
-def recibir_objeto(sock):
+def receive_object(sock):
+    """Receive a pickled object from socket with 8-byte size header."""
     header = b''
     while len(header) < 8:
         chunk = sock.recv(8 - len(header))
@@ -132,210 +91,216 @@ def recibir_objeto(sock):
 
 
 # ──────────────────────────────────────────────────────────────
-#  CSV
-#
-#  detalle_Nworkers.csv  — progresión ronda a ronda
-#  resumen_Nworkers.csv  — una fila por repetición completada
+#  FEDERATED LEARNING OPERATIONS
 # ──────────────────────────────────────────────────────────────
-CABECERA_DETALLE = [
-    'n_workers', 'n_rondas_config', 'repeticion', 'ronda',
-    'perdida', 'precision_test', 'tiempo_ronda_seg',
+def average_state_dicts(state_dicts):
+    """FedAvg: compute element-wise average of model state dicts."""
+    avg = copy.deepcopy(state_dicts[0])
+    for key in avg:
+        avg[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
+    return avg
+
+
+def evaluate_model(model, loader):
+    """Evaluate model accuracy on test set (no gradients)."""
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            correct += (model(x).argmax(1) == y).sum().item()
+            total += len(y)
+    return correct / total if total > 0 else 0.0
+
+
+# ──────────────────────────────────────────────────────────────
+#  CSV LOGGING
+# ──────────────────────────────────────────────────────────────
+DETAIL_HEADER = [
+    'n_workers', 'n_epochs_config', 'repetition', 'epoch',
+    'loss', 'test_accuracy', 'epoch_time_sec',
 ]
-CABECERA_RESUMEN = [
-    'n_workers', 'n_rondas_config', 'repeticion',
-    'precision_test_final', 'perdida_final',
-    'tiempo_total_seg', 'tiempo_promedio_ronda_seg',
+SUMMARY_HEADER = [
+    'n_workers', 'n_epochs_config', 'repetition',
+    'final_test_accuracy', 'final_loss',
+    'total_time_sec', 'avg_epoch_time_sec',
 ]
 
 
-def inicializar_csv(ruta, cabecera):
-    os.makedirs(os.path.dirname(ruta), exist_ok=True)
-    with open(ruta, 'w', newline='') as f:
-        csv.writer(f).writerow(cabecera)
-    log(f"CSV creado: {ruta}")
+def init_csv(path, header):
+    """Initialize CSV file with header row."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', newline='') as f:
+        csv.writer(f).writerow(header)
+    log(f"CSV created: {path}")
 
 
-def guardar_fila_detalle(ruta, n_rondas_config, rep, ronda, perdida, prec, t):
-    with open(ruta, 'a', newline='') as f:
+def save_detail_row(path, n_epochs, rep, epoch, loss, acc, t):
+    """Append detailed epoch-level result to CSV."""
+    with open(path, 'a', newline='') as f:
         csv.writer(f).writerow([
-            N_WORKERS, n_rondas_config, rep, ronda,
-            round(perdida, 6), round(prec, 6), round(t, 4),
+            N_WORKERS, n_epochs, rep, epoch,
+            round(loss, 6), round(acc, 6), round(t, 4),
         ])
 
 
-def guardar_fila_resumen(ruta, n_rondas_config, rep, historial):
-    tiempo_total    = sum(e['t'] for e in historial)
-    tiempo_promedio = tiempo_total / len(historial)
-    with open(ruta, 'a', newline='') as f:
+def save_summary_row(path, n_epochs, rep, history):
+    """Append experiment summary row to CSV."""
+    total_time = sum(e['t'] for e in history)
+    avg_time = total_time / len(history)
+    with open(path, 'a', newline='') as f:
         csv.writer(f).writerow([
-            N_WORKERS, n_rondas_config, rep,
-            round(historial[-1]['prec'],    6),
-            round(historial[-1]['perdida'], 6),
-            round(tiempo_total,             2),
-            round(tiempo_promedio,          4),
+            N_WORKERS, n_epochs, rep,
+            round(history[-1]['acc'], 6),
+            round(history[-1]['loss'], 6),
+            round(total_time, 2),
+            round(avg_time, 4),
         ])
 
-
 # ──────────────────────────────────────────────────────────────
-#  BUCLE DE ENTRENAMIENTO (una sola repetición)
+#  TRAINING LOOP
 # ──────────────────────────────────────────────────────────────
-def ejecutar_entrenamiento(conexiones, n_rondas, rep,
-                           model, test_loader, ruta_detalle):
-    historial = []
+def run_training(connections, n_epochs, rep, model, test_loader, detail_path):
+    """Execute federated training for specified number of epochs."""
+    history = []
 
-    for ronda in range(n_rondas):
+    for epoch in range(n_epochs):
         t0 = time.perf_counter()
 
-        # Extraer pesos actuales (CPU, serializable con pickle)
-        sd_actual = {k: v.cpu() for k, v in model.state_dict().items()}
+        # Extract current weights (CPU, pickle-serializable)
+        current_sd = {k: v.cpu() for k, v in model.state_dict().items()}
 
-        # Enviar a todos los workers
-        for c in conexiones:
-            enviar_objeto(c['sock'], {
-                'tipo':        'TRAIN',
-                'state_dict':  sd_actual,
-                'lr':          TASA_APRENDIZAJE,
-                'ronda':       ronda,
+        # Broadcast to all workers
+        for conn in connections:
+            send_object(conn['sock'], {
+                'type': 'TRAIN',
+                'state_dict': current_sd,
+                'lr': LEARNING_RATE,
+                'epoch': epoch,
             })
 
-        # Recoger resultados
-        resultados = []
-        for c in conexiones:
-            r = recibir_objeto(c['sock'])
-            if r and r.get('tipo') == 'RESULT':
-                resultados.append(r)
+        # Collect results from workers
+        results = []
+        for conn in connections:
+            r = receive_object(conn['sock'])
+            if r and r.get('type') == 'RESULT':
+                results.append(r)
 
-        t_ronda = time.perf_counter() - t0
+        epoch_time = time.perf_counter() - t0
 
-        if resultados:
-            avg_sd  = promediar_state_dicts([r['state_dict'] for r in resultados])
+        if results:
+            avg_sd = average_state_dicts([r['state_dict'] for r in results])
             model.load_state_dict(avg_sd)
-            perdida = float(np.mean([r['perdida'] for r in resultados]))
-            prec    = calcular_precision(model, test_loader)
+            loss = float(np.mean([r['loss'] for r in results]))
+            acc = evaluate_model(model, test_loader)
         else:
-            perdida, prec = -1.0, -1.0
+            loss, acc = -1.0, -1.0
 
-        historial.append({'perdida': perdida, 'prec': prec, 't': t_ronda})
-        guardar_fila_detalle(ruta_detalle, n_rondas, rep, ronda, perdida, prec, t_ronda)
+        history.append({'loss': loss, 'acc': acc, 't': epoch_time})
+        save_detail_row(detail_path, n_epochs, rep, epoch, loss, acc, epoch_time)
 
-        if ronda % 10 == 0 or ronda == n_rondas - 1:
-            log(f"  [rondas={n_rondas:>4} rep={rep}] "
-                f"{ronda+1:>4}/{n_rondas} | "
-                f"loss={perdida:.4f} | "
-                f"test={prec*100:.1f}% | "
-                f"t={t_ronda:.2f}s")
+        if epoch % 5 == 0 or epoch == n_epochs - 1:  # More frequent logging
+            log(f"  [epochs={n_epochs:>3} rep={rep}] "
+                f"{epoch+1:>3}/{n_epochs} | "
+                f"loss={loss:.4f} | "
+                f"test={acc*100:.1f}% | "
+                f"t={epoch_time:.2f}s")
 
-    return historial
+    return history
 
-
-# ──────────────────────────────────────────────────────────────
-#  MAIN
-# ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    os.makedirs(DIRECTORIO_RESULTADOS, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # ── Cargar CIFAR-10 ──────────────────────────────────────
-    log("Cargando CIFAR-10...")
+    log("Loading CIFAR-10...")
 
-    # Normalización estándar CIFAR-10
-    MEAN = (0.4914, 0.4822, 0.4465)
-    STD  = (0.2470, 0.2435, 0.2616)
-
-    tf_test = transforms.Compose([
+    test_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(MEAN, STD),
+        transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
     ])
 
-    test_ds     = datasets.CIFAR10('data', train=False, download=True, transform=tf_test)
+    test_dataset = datasets.CIFAR10('data', train=False, download=True, transform=test_transform)
     test_loader = torch.utils.data.DataLoader(
-        test_ds, batch_size=256, shuffle=False, num_workers=0,
+        test_dataset, batch_size=256, shuffle=False, num_workers=0,
     )
 
-    # Dataset de entrenamiento en crudo (uint8): los workers normalizan + augmentan
-    train_ds_raw = datasets.CIFAR10('data', train=True, download=True)
-    X_train = train_ds_raw.data            # (50000, 32, 32, 3) uint8 numpy
-    y_train = np.array(train_ds_raw.targets)
+    train_raw = datasets.CIFAR10('data', train=True, download=True)
+    X_train = train_raw.data
+    y_train = np.array(train_raw.targets)
 
-    # Mezcla aleatoria reproducible
+    # Reproducible shuffle
     rng = np.random.default_rng(42)
     idx = rng.permutation(len(X_train))
     X_train, y_train = X_train[idx], y_train[idx]
 
-    log(f"Dataset: {len(X_train)} train · {len(test_ds)} test")
+    log(f"Dataset: {len(X_train)} train · {len(test_dataset)} test")
 
-    # ── Esperar workers ──────────────────────────────────────
-    log(f"Esperando {N_WORKERS} workers en {HOST}:{PORT}...")
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(N_WORKERS)
+    log(f"Waiting for {N_WORKERS} workers on {HOST}:{PORT}...")
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(N_WORKERS)
 
-    conexiones = []
+    connections = []
     for i in range(N_WORKERS):
-        conn, addr = srv.accept()
-        hello = recibir_objeto(conn)
-        name  = hello.get('name', str(addr)) if hello else str(addr)
-        conexiones.append({'sock': conn, 'name': name})
+        conn, addr = server.accept()
+        hello = receive_object(conn)
+        name = hello.get('name', str(addr)) if hello else str(addr)
+        connections.append({'sock': conn, 'name': name})
         log(f"  Worker {i+1}/{N_WORKERS}: {name} ({addr})")
-    srv.close()
+    server.close()
 
-    # ── Distribuir datos UNA sola vez ────────────────────────
-    tam = len(X_train) // N_WORKERS
-    for i, c in enumerate(conexiones):
-        inicio = i * tam
-        fin    = inicio + tam if i < N_WORKERS - 1 else len(X_train)
-        enviar_objeto(c['sock'], {
-            'tipo':       'INIT',
-            'X':          X_train[inicio:fin],   # (shard, 32, 32, 3) uint8
-            'y':          y_train[inicio:fin],
+    shard_size = len(X_train) // N_WORKERS
+    for i, conn in enumerate(connections):
+        start = i * shard_size
+        end = start + shard_size if i < N_WORKERS - 1 else len(X_train)
+        send_object(conn['sock'], {
+            'type': 'INIT',
+            'X': X_train[start:end],
+            'y': y_train[start:end],
             'worker_idx': i,
             'batch_size': BATCH_SIZE,
-            'mean':       MEAN,
-            'std':        STD,
+            'mean': CIFAR10_MEAN,
+            'std': CIFAR10_STD,
         })
-        log(f"  Shard {i}: muestras {inicio}–{fin-1} → {c['name']}")
-    log("Datos distribuidos. Iniciando malla.\n")
+        log(f"  Shard {i}: samples {start}-{end-1} → {conn['name']}")
+    log("Data distributed. Starting experiment grid.\n")
 
-    # ── Crear CSVs ───────────────────────────────────────────
-    ruta_detalle = os.path.join(DIRECTORIO_RESULTADOS, f'detalle_{N_WORKERS}workers.csv')
-    ruta_resumen = os.path.join(DIRECTORIO_RESULTADOS, f'resumen_{N_WORKERS}workers.csv')
-    inicializar_csv(ruta_detalle, CABECERA_DETALLE)
-    inicializar_csv(ruta_resumen, CABECERA_RESUMEN)
+    detail_path = os.path.join(RESULTS_DIR, f'detail_{N_WORKERS}workers.csv')
+    summary_path = os.path.join(RESULTS_DIR, f'summary_{N_WORKERS}workers.csv')
+    init_csv(detail_path, DETAIL_HEADER)
+    init_csv(summary_path, SUMMARY_HEADER)
 
-    # ── Malla de experimentación ─────────────────────────────
-    total_configs = len(MALLA_RONDAS)
-    for cfg_idx, n_rondas in enumerate(MALLA_RONDAS, start=1):
+    total_configs = len(EPOCHS_GRID)
+    for cfg_idx, n_epochs in enumerate(EPOCHS_GRID, start=1):
         log("=" * 60)
-        log(f"CONFIGURACIÓN {cfg_idx}/{total_configs}: {n_rondas} rondas  "
-            f"({REPETICIONES} repeticiones)")
+        log(f"CONFIGURATION {cfg_idx}/{total_configs}: {n_epochs} epochs "
+            f"({REPETITIONS} repetitions)")
         log("=" * 60)
 
-        for rep in range(1, REPETICIONES + 1):
-            log(f"  ── Repetición {rep}/{REPETICIONES} ──")
+        for rep in range(1, REPETITIONS + 1):
+            log(f"  ── Repetition {rep}/{REPETITIONS} ──")
             t_rep = time.perf_counter()
 
-            # Reinicializar modelo en cada repetición
             model = CIFAR10CNN().to(DEVICE)
 
-            historial = ejecutar_entrenamiento(
-                conexiones, n_rondas, rep,
-                model, test_loader, ruta_detalle,
+            history = run_training(
+                connections, n_epochs, rep,
+                model, test_loader, detail_path,
             )
-            guardar_fila_resumen(ruta_resumen, n_rondas, rep, historial)
+            save_summary_row(summary_path, n_epochs, rep, history)
 
-            log(f"  Rep {rep} lista en {time.perf_counter()-t_rep:.1f}s | "
-                f"acc final={historial[-1]['prec']*100:.2f}%\n")
+            log(f"  Rep {rep} completed in {time.perf_counter()-t_rep:.1f}s | "
+                f"final acc={history[-1]['acc']*100:.2f}%\n")
 
-    # ── Cerrar workers ───────────────────────────────────────
-    for c in conexiones:
+    for conn in connections:
         try:
-            enviar_objeto(c['sock'], {'tipo': 'EXPERIMENT_END'})
-            c['sock'].close()
+            send_object(conn['sock'], {'type': 'EXPERIMENT_END'})
+            conn['sock'].close()
         except Exception:
             pass
 
     log("=" * 60)
-    log("Malla completada.")
-    log(f"  Detalle → {ruta_detalle}")
-    log(f"  Resumen → {ruta_resumen}")
+    log("Experiment grid completed.")
+    log(f"  Details → {detail_path}")
+    log(f"  Summary → {summary_path}")
     log("=" * 60)
