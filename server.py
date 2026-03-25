@@ -1,72 +1,118 @@
+# ============================================================
+#  server.py  –  Parameter server con FedAvg (PyTorch + CNN)
+#  Dataset  : CIFAR-10  (32×32×3, 10 clases)
+#  Protocolo: igual que la versión MNIST original
+#             INIT → TRAIN×N_rondas → EXPERIMENT_END
+# ============================================================
+
 import socket
 import pickle
-import numpy as np
 import csv
 import os
 import time
+import copy
 from datetime import datetime
-from sklearn.datasets import fetch_openml
 
-# --------------------------------------------------
-# CONFIG  ← los únicos valores que hay que tocar
-# --------------------------------------------------
-N_WORKERS        = 2
-N_NEURONAS       = 256               # neuronas de la capa oculta, fijo
-MALLA_EPOCAS     = [100, 250, 500]  # configuraciones a comparar
-REPETICIONES     = 5                 # repeticiones por configuración
-TASA_APRENDIZAJE = 0.1
-HOST             = '0.0.0.0'
-PORT             = 5000
-BUFFER_SIZE      = 4096 * 1024
+import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+
+# ──────────────────────────────────────────────────────────────
+#  CONFIG  ← los únicos valores que hay que tocar
+# ──────────────────────────────────────────────────────────────
+N_WORKERS    = 2
+
+# Cada valor es el número de RONDAS de comunicación a comparar.
+# Una ronda = workers entrenan 1 epoch sobre su shard y devuelven pesos.
+MALLA_RONDAS  = [30, 60, 100]
+
+REPETICIONES        = 3
+TASA_APRENDIZAJE    = 0.001   # Adam en los workers
+BATCH_SIZE          = 128     # tamaño de mini-batch en los workers
+
+HOST        = '0.0.0.0'
+PORT        = 5000
+BUFFER_SIZE = 4096 * 1024
 DIRECTORIO_RESULTADOS = 'resultados'
 
-# --------------------------------------------------
-# LOGGING
-# --------------------------------------------------
+DEVICE = torch.device('cpu')   # el servidor sólo promedia y evalúa
+
+
+# ──────────────────────────────────────────────────────────────
+#  LOGGING
+# ──────────────────────────────────────────────────────────────
 def log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# --------------------------------------------------
-# RED NEURONAL
-# --------------------------------------------------
-def crear_params():
-    return {
-        'W1': np.random.randn(784, N_NEURONAS) * 0.05,
-        'b1': np.full(N_NEURONAS, 0.01, dtype=float),
-        'W2': np.random.randn(N_NEURONAS, 10) * 0.05,
-        'b2': np.full(10, 0.01, dtype=float),
-    }
 
-def promediar_pesos(lista_params):
-    n = len(lista_params)
-    return {k: sum(p[k] for p in lista_params) / n for k in lista_params[0]}
+# ──────────────────────────────────────────────────────────────
+#  ARQUITECTURA CNN (debe ser idéntica en worker.py)
+#
+#  Cambio respecto al diagrama: sin Softmax final.
+#  CrossEntropyLoss ya incluye log-softmax; añadirlo explícitamente
+#  causa inestabilidad numérica. Es la práctica estándar en PyTorch.
+# ──────────────────────────────────────────────────────────────
+class CIFAR10CNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            # ── Bloque conv 1  →  16×16×32 ──────────────────
+            nn.Conv2d(3,  32, 3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(),
+            nn.MaxPool2d(2), nn.Dropout2d(0.2),
+            # ── Bloque conv 2  →  8×8×64 ────────────────────
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(),
+            nn.MaxPool2d(2), nn.Dropout2d(0.3),
+            # ── Bloque conv 3  →  4×4×128 ───────────────────
+            nn.Conv2d(64,  128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.MaxPool2d(2), nn.Dropout2d(0.4),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, 128), nn.BatchNorm1d(128), nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 10),           # sin Softmax — ver nota arriba
+        )
 
-def calcular_precision(X, y, params):
-    z1 = np.dot(X, params['W1']) + params['b1']
-    a1 = np.maximum(0, z1)
-    z2 = np.dot(a1, params['W2']) + params['b2']
-    exp_z = np.exp(z2 - np.max(z2, axis=1, keepdims=True))
-    a2 = exp_z / np.sum(exp_z, axis=1, keepdims=True)
-    return float(np.mean(np.argmax(a2, axis=1) == y))
+    def forward(self, x):
+        return self.classifier(self.features(x))
 
-def dividir_dataset(X, y, n_partes):
-    tam = len(X) // n_partes
-    return [(X[i*tam : (i+1)*tam if i < n_partes-1 else len(X)],
-             y[i*tam : (i+1)*tam if i < n_partes-1 else len(y)])
-            for i in range(n_partes)]
 
-def one_hot(y, num_clases=10):
-    oh = np.zeros((len(y), num_clases))
-    oh[np.arange(len(y)), y] = 1
-    return oh
+# ──────────────────────────────────────────────────────────────
+#  FedAvg: promedio de state_dicts
+# ──────────────────────────────────────────────────────────────
+def promediar_state_dicts(lista_sd):
+    avg = copy.deepcopy(lista_sd[0])
+    for key in avg:
+        avg[key] = torch.stack([sd[key].float() for sd in lista_sd]).mean(dim=0)
+    return avg
 
-# --------------------------------------------------
-# COMUNICACIÓN
-# --------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────
+#  EVALUACIÓN (servidor, sin gradientes)
+# ──────────────────────────────────────────────────────────────
+def calcular_precision(model, loader):
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            correct += (model(x).argmax(1) == y).sum().item()
+            total   += len(y)
+    return correct / total
+
+
+# ──────────────────────────────────────────────────────────────
+#  COMUNICACIÓN
+# ──────────────────────────────────────────────────────────────
 def enviar_objeto(sock, obj):
     data = pickle.dumps(obj)
-    sock.sendall(len(data).to_bytes(8, byteorder='big'))
+    sock.sendall(len(data).to_bytes(8, 'big'))
     sock.sendall(data)
+
 
 def recibir_objeto(sock):
     header = b''
@@ -75,7 +121,7 @@ def recibir_objeto(sock):
         if not chunk:
             return None
         header += chunk
-    size = int.from_bytes(header, byteorder='big')
+    size = int.from_bytes(header, 'big')
     data = b''
     while len(data) < size:
         chunk = sock.recv(min(BUFFER_SIZE, size - len(data)))
@@ -84,32 +130,23 @@ def recibir_objeto(sock):
         data += chunk
     return pickle.loads(data)
 
-# --------------------------------------------------
-# CSV
+
+# ──────────────────────────────────────────────────────────────
+#  CSV
 #
-# detalle_Nworkers.csv
-#   Progresión época a época de cada corrida.
-#   Útil para graficar curvas de aprendizaje.
-#   Clave: (n_workers, n_neuronas, n_epocas_config, repeticion, epoca)
-#
-# resumen_Nworkers.csv
-#   Una fila por repetición completada con sus métricas finales.
-#   Diseñado para comparar entre experimentos con distinto n_workers:
-#   al concatenar resumen_2workers.csv + resumen_4workers.csv + ...
-#   se puede filtrar/agrupar por n_workers y comparar directamente
-#   precisión final y tiempo de entrenamiento.
-#   Clave: (n_workers, n_neuronas, n_epocas_config, repeticion)
-# --------------------------------------------------
+#  detalle_Nworkers.csv  — progresión ronda a ronda
+#  resumen_Nworkers.csv  — una fila por repetición completada
+# ──────────────────────────────────────────────────────────────
 CABECERA_DETALLE = [
-    'n_workers', 'n_neuronas', 'n_epocas_config', 'repeticion', 'epoca',
-    'perdida', 'precision_test', 'tiempo_epoca_seg',
+    'n_workers', 'n_rondas_config', 'repeticion', 'ronda',
+    'perdida', 'precision_test', 'tiempo_ronda_seg',
+]
+CABECERA_RESUMEN = [
+    'n_workers', 'n_rondas_config', 'repeticion',
+    'precision_test_final', 'perdida_final',
+    'tiempo_total_seg', 'tiempo_promedio_ronda_seg',
 ]
 
-CABECERA_RESUMEN = [
-    'n_workers', 'n_neuronas', 'n_epocas_config', 'repeticion',
-    'precision_test_final', 'perdida_final',
-    'tiempo_total_seg', 'tiempo_promedio_epoca_seg',
-]
 
 def inicializar_csv(ruta, cabecera):
     os.makedirs(os.path.dirname(ruta), exist_ok=True)
@@ -117,156 +154,179 @@ def inicializar_csv(ruta, cabecera):
         csv.writer(f).writerow(cabecera)
     log(f"CSV creado: {ruta}")
 
-def guardar_fila_detalle(ruta, n_epocas_config, rep, epoca,
-                         perdida, precision, t_epoca):
+
+def guardar_fila_detalle(ruta, n_rondas_config, rep, ronda, perdida, prec, t):
     with open(ruta, 'a', newline='') as f:
         csv.writer(f).writerow([
-            N_WORKERS, N_NEURONAS, n_epocas_config, rep, epoca,
-            round(perdida,   6),
-            round(precision, 6),
-            round(t_epoca,   4),
+            N_WORKERS, n_rondas_config, rep, ronda,
+            round(perdida, 6), round(prec, 6), round(t, 4),
         ])
 
-def guardar_fila_resumen(ruta, n_epocas_config, rep, historial):
-    """Una fila por repetición completada con sus métricas finales."""
-    tiempo_total   = sum(e['t_epoca']   for e in historial)
+
+def guardar_fila_resumen(ruta, n_rondas_config, rep, historial):
+    tiempo_total    = sum(e['t'] for e in historial)
     tiempo_promedio = tiempo_total / len(historial)
     with open(ruta, 'a', newline='') as f:
         csv.writer(f).writerow([
-            N_WORKERS,
-            N_NEURONAS,
-            n_epocas_config,
-            rep,
-            round(historial[-1]['precision'], 6),
-            round(historial[-1]['perdida'],   6),
-            round(tiempo_total,              2),
-            round(tiempo_promedio,           4),
+            N_WORKERS, n_rondas_config, rep,
+            round(historial[-1]['prec'],    6),
+            round(historial[-1]['perdida'], 6),
+            round(tiempo_total,             2),
+            round(tiempo_promedio,          4),
         ])
 
-# --------------------------------------------------
-# BUCLE DE ENTRENAMIENTO (una sola repetición)
-# --------------------------------------------------
-def ejecutar_entrenamiento(conexiones, n_epocas_config, rep,
-                           X_test, y_test, ruta_detalle):
-    params = crear_params()
+
+# ──────────────────────────────────────────────────────────────
+#  BUCLE DE ENTRENAMIENTO (una sola repetición)
+# ──────────────────────────────────────────────────────────────
+def ejecutar_entrenamiento(conexiones, n_rondas, rep,
+                           model, test_loader, ruta_detalle):
     historial = []
 
-    for epoca in range(n_epocas_config):
+    for ronda in range(n_rondas):
         t0 = time.perf_counter()
 
+        # Extraer pesos actuales (CPU, serializable con pickle)
+        sd_actual = {k: v.cpu() for k, v in model.state_dict().items()}
+
+        # Enviar a todos los workers
         for c in conexiones:
             enviar_objeto(c['sock'], {
-                'tipo': 'TRAIN',
-                'params': params,
-                'tasa_aprendizaje': TASA_APRENDIZAJE,
-                'epoca': epoca,
+                'tipo':        'TRAIN',
+                'state_dict':  sd_actual,
+                'lr':          TASA_APRENDIZAJE,
+                'ronda':       ronda,
             })
 
+        # Recoger resultados
         resultados = []
         for c in conexiones:
-            resp = recibir_objeto(c['sock'])
-            if resp and resp.get('tipo') == 'RESULT':
-                resultados.append(resp)
+            r = recibir_objeto(c['sock'])
+            if r and r.get('tipo') == 'RESULT':
+                resultados.append(r)
 
-        t_epoca = time.perf_counter() - t0
+        t_ronda = time.perf_counter() - t0
 
         if resultados:
-            params    = promediar_pesos([r['params'] for r in resultados])
-            perdida   = float(np.mean([r['perdida']  for r in resultados]))
-            precision = calcular_precision(X_test, y_test, params)
+            avg_sd  = promediar_state_dicts([r['state_dict'] for r in resultados])
+            model.load_state_dict(avg_sd)
+            perdida = float(np.mean([r['perdida'] for r in resultados]))
+            prec    = calcular_precision(model, test_loader)
         else:
-            perdida, precision = -1.0, -1.0
+            perdida, prec = -1.0, -1.0
 
-        historial.append({'perdida': perdida, 'precision': precision, 't_epoca': t_epoca})
-        guardar_fila_detalle(ruta_detalle, n_epocas_config, rep,
-                             epoca, perdida, precision, t_epoca)
+        historial.append({'perdida': perdida, 'prec': prec, 't': t_ronda})
+        guardar_fila_detalle(ruta_detalle, n_rondas, rep, ronda, perdida, prec, t_ronda)
 
-        if epoca % 50 == 0 or epoca == n_epocas_config - 1:
-            log(f"  [épocas={n_epocas_config:>4} rep={rep}] "
-                f"época {epoca+1:>4}/{n_epocas_config} | "
-                f"pérdida={perdida:.4f} | "
-                f"test={precision*100:.1f}% | "
-                f"t={t_epoca:.2f}s")
+        if ronda % 10 == 0 or ronda == n_rondas - 1:
+            log(f"  [rondas={n_rondas:>4} rep={rep}] "
+                f"{ronda+1:>4}/{n_rondas} | "
+                f"loss={perdida:.4f} | "
+                f"test={prec*100:.1f}% | "
+                f"t={t_ronda:.2f}s")
 
     return historial
 
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     os.makedirs(DIRECTORIO_RESULTADOS, exist_ok=True)
 
-    # ── Cargar dataset ────────────────────────────────────────────
-    log("Cargando MNIST...")
-    mnist = fetch_openml('mnist_784', version=1, parser='auto')
-    X = mnist.data.astype('float32').to_numpy() / 255.0
-    y = mnist.target.astype('int32').to_numpy()
-    indices = np.random.permutation(len(X))
-    X, y = X[indices], y[indices]
-    X_train, X_test = X[:60000], X[60000:]
-    y_train, y_test = y[:60000], y[60000:]
-    y_train_oh = one_hot(y_train)
-    log(f"Dataset: {len(X_train)} train · {len(X_test)} test")
+    # ── Cargar CIFAR-10 ──────────────────────────────────────
+    log("Cargando CIFAR-10...")
 
-    # ── Esperar workers ───────────────────────────────────────────
+    # Normalización estándar CIFAR-10
+    MEAN = (0.4914, 0.4822, 0.4465)
+    STD  = (0.2470, 0.2435, 0.2616)
+
+    tf_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(MEAN, STD),
+    ])
+
+    test_ds     = datasets.CIFAR10('data', train=False, download=True, transform=tf_test)
+    test_loader = torch.utils.data.DataLoader(
+        test_ds, batch_size=256, shuffle=False, num_workers=0,
+    )
+
+    # Dataset de entrenamiento en crudo (uint8): los workers normalizan + augmentan
+    train_ds_raw = datasets.CIFAR10('data', train=True, download=True)
+    X_train = train_ds_raw.data            # (50000, 32, 32, 3) uint8 numpy
+    y_train = np.array(train_ds_raw.targets)
+
+    # Mezcla aleatoria reproducible
+    rng = np.random.default_rng(42)
+    idx = rng.permutation(len(X_train))
+    X_train, y_train = X_train[idx], y_train[idx]
+
+    log(f"Dataset: {len(X_train)} train · {len(test_ds)} test")
+
+    # ── Esperar workers ──────────────────────────────────────
     log(f"Esperando {N_WORKERS} workers en {HOST}:{PORT}...")
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((HOST, PORT))
-    server_sock.listen(N_WORKERS)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(N_WORKERS)
 
     conexiones = []
     for i in range(N_WORKERS):
-        conn, addr = server_sock.accept()
+        conn, addr = srv.accept()
         hello = recibir_objeto(conn)
-        name = hello.get('name', str(addr)) if hello else str(addr)
+        name  = hello.get('name', str(addr)) if hello else str(addr)
         conexiones.append({'sock': conn, 'name': name})
         log(f"  Worker {i+1}/{N_WORKERS}: {name} ({addr})")
-    server_sock.close()
+    srv.close()
 
-    # ── Distribuir datos UNA sola vez ─────────────────────────────
-    partes = dividir_dataset(X_train, y_train_oh, N_WORKERS)
+    # ── Distribuir datos UNA sola vez ────────────────────────
+    tam = len(X_train) // N_WORKERS
     for i, c in enumerate(conexiones):
+        inicio = i * tam
+        fin    = inicio + tam if i < N_WORKERS - 1 else len(X_train)
         enviar_objeto(c['sock'], {
-            'tipo': 'INIT',
-            'X': partes[i][0],
-            'y': partes[i][1],
+            'tipo':       'INIT',
+            'X':          X_train[inicio:fin],   # (shard, 32, 32, 3) uint8
+            'y':          y_train[inicio:fin],
             'worker_idx': i,
+            'batch_size': BATCH_SIZE,
+            'mean':       MEAN,
+            'std':        STD,
         })
-    log("Datos distribuidos. Iniciando malla de experimentación.\n")
+        log(f"  Shard {i}: muestras {inicio}–{fin-1} → {c['name']}")
+    log("Datos distribuidos. Iniciando malla.\n")
 
-    # ── Crear CSVs ────────────────────────────────────────────────
+    # ── Crear CSVs ───────────────────────────────────────────
     ruta_detalle = os.path.join(DIRECTORIO_RESULTADOS, f'detalle_{N_WORKERS}workers.csv')
     ruta_resumen = os.path.join(DIRECTORIO_RESULTADOS, f'resumen_{N_WORKERS}workers.csv')
     inicializar_csv(ruta_detalle, CABECERA_DETALLE)
     inicializar_csv(ruta_resumen, CABECERA_RESUMEN)
 
-    # ── Malla de experimentación ──────────────────────────────────
-    total_configs = len(MALLA_EPOCAS)
-    for cfg_idx, n_epocas_config in enumerate(MALLA_EPOCAS, start=1):
+    # ── Malla de experimentación ─────────────────────────────
+    total_configs = len(MALLA_RONDAS)
+    for cfg_idx, n_rondas in enumerate(MALLA_RONDAS, start=1):
         log("=" * 60)
-        log(f"CONFIGURACIÓN {cfg_idx}/{total_configs}: {n_epocas_config} épocas  "
-            f"({REPETICIONES} repeticiones · {N_NEURONAS} neuronas ocultas)")
+        log(f"CONFIGURACIÓN {cfg_idx}/{total_configs}: {n_rondas} rondas  "
+            f"({REPETICIONES} repeticiones)")
         log("=" * 60)
 
         for rep in range(1, REPETICIONES + 1):
             log(f"  ── Repetición {rep}/{REPETICIONES} ──")
             t_rep = time.perf_counter()
 
+            # Reinicializar modelo en cada repetición
+            model = CIFAR10CNN().to(DEVICE)
+
             historial = ejecutar_entrenamiento(
-                conexiones, n_epocas_config, rep,
-                X_test, y_test, ruta_detalle,
+                conexiones, n_rondas, rep,
+                model, test_loader, ruta_detalle,
             )
+            guardar_fila_resumen(ruta_resumen, n_rondas, rep, historial)
 
-            # Guardar fila de resumen inmediatamente al terminar la repetición
-            guardar_fila_resumen(ruta_resumen, n_epocas_config, rep, historial)
+            log(f"  Rep {rep} lista en {time.perf_counter()-t_rep:.1f}s | "
+                f"acc final={historial[-1]['prec']*100:.2f}%\n")
 
-            log(f"  Repetición {rep} finalizada en "
-                f"{time.perf_counter()-t_rep:.1f}s | "
-                f"pérdida final={historial[-1]['perdida']:.4f} | "
-                f"test final={historial[-1]['precision']*100:.2f}%\n")
-
-    # ── Cerrar workers ────────────────────────────────────────────
+    # ── Cerrar workers ───────────────────────────────────────
     for c in conexiones:
         try:
             enviar_objeto(c['sock'], {'tipo': 'EXPERIMENT_END'})
@@ -276,6 +336,6 @@ if __name__ == '__main__':
 
     log("=" * 60)
     log("Malla completada.")
-    log(f"  Detalle  → {ruta_detalle}")
-    log(f"  Resumen  → {ruta_resumen}")
+    log(f"  Detalle → {ruta_detalle}")
+    log(f"  Resumen → {ruta_resumen}")
     log("=" * 60)
